@@ -1,0 +1,23 @@
+[
+    {
+        "room": "1926784908",
+        "msg": "钓鱼",
+        "loop": 10,
+        "send_interval": 5,
+        "uname": "宝贝月玥酱"
+    },
+    {
+        "room": "1926784908",
+        "msg": "打劫",
+        "loop": 10,
+        "send_interval": 5,
+        "uname": "宝贝月玥酱"
+    },
+    {
+        "room": "1926784908",
+        "uname": "宝贝月玥酱",
+        "msg": "喵",
+        "loop": 7,
+        "send_interval": 1800
+    }
+]
