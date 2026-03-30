@@ -5,7 +5,8 @@ import re
 import time
 import json
 import os
-from bilibili_login import COOKIE_PATH, HEADERS
+from bilibili_login import COOKIE_PATH, HEADERS, REQUEST_TIMEOUT
+from bilibili_errors import format_bilibili_error
 
 # ==========================================
 # 1. 全局配置区 (Constants & Config)
@@ -16,6 +17,41 @@ MIXIN_KEY_ENC_TAB = [
     61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
     36, 20, 34, 44, 52
 ]
+
+
+class BilibiliApiError(RuntimeError):
+    pass
+
+
+def _extract_api_message(payload: dict) -> str:
+    return (
+        payload.get("message")
+        or payload.get("msg")
+        or payload.get("data", {}).get("message")
+        or payload.get("data", {}).get("msg")
+        or "未知错误"
+    )
+
+
+def _request_json(method: str, url: str, *, action: str, **kwargs) -> dict:
+    headers = kwargs.pop("headers", HEADERS)
+    response = requests.request(
+        method,
+        url,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+        **kwargs,
+    )
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise BilibiliApiError(f"{action}失败：接口返回了非 JSON 数据") from exc
+
+    code = payload.get("code")
+    if code != 0:
+        raise BilibiliApiError(f"{action}失败：{format_bilibili_error(code, _extract_api_message(payload))}")
+    return payload
 
 def load_fresh_auth():
     """动态读取最新的 Cookie 和 Token"""
@@ -30,6 +66,8 @@ def load_fresh_auth():
     
     csrf_token = cookies.get('bili_jct', '')
     uid = cookies.get('DedeUserID', '')
+    if not csrf_token or not uid:
+        raise BilibiliApiError("登录凭证缺少必要字段，请重新扫码登录")
     
     return cookies, csrf_token, uid
 
@@ -39,9 +77,14 @@ def load_fresh_auth():
 def get_wbi_keys():
     """获取全局 WBI 密钥"""
     cookies, _, _ = load_fresh_auth()
-    response = requests.get('https://api.bilibili.com/x/web-interface/nav', headers=HEADERS, cookies=cookies)
-    img_url: str = response.json()['data']['wbi_img']['img_url']
-    sub_url: str = response.json()['data']['wbi_img']['sub_url']
+    payload = _request_json(
+        'GET',
+        'https://api.bilibili.com/x/web-interface/nav',
+        action='获取 WBI 密钥',
+        cookies=cookies,
+    )
+    img_url: str = payload['data']['wbi_img']['img_url']
+    sub_url: str = payload['data']['wbi_img']['sub_url']
     return img_url.split('/')[-1].split('.')[0], sub_url.split('/')[-1].split('.')[0]
 
 def get_mixin_key(img_key: str, sub_key: str) -> str:
@@ -70,14 +113,11 @@ def get_anchor_id(room_id):
     """返回主播 UID"""
     url = f'https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={room_id}'
     try:
-        response = requests.get(url, headers=HEADERS)
-        res_json = response.json()
-        if res_json.get("code") == 0:
-            info_dict = res_json.get("data", {}).get("info")
-            if info_dict is not None:
-                return str(info_dict.get("uid"))
-        else:
-            return None
+        res_json = _request_json('GET', url, action='获取主播 UID')
+        info_dict = res_json.get("data", {}).get("info")
+        if info_dict is not None:
+            uid = info_dict.get("uid")
+            return str(uid) if uid is not None else None
     except Exception:
         return None
 
@@ -85,14 +125,10 @@ def get_anchor_name(room_id):
     """返回主播昵称"""
     url = f"https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={room_id}"
     try:
-        response = requests.get(url, headers=HEADERS)
-        res_json = response.json()
-        if res_json.get("code") == 0:
-            info_dict = res_json.get("data", {}).get("info")
-            if info_dict is not None:
-                return info_dict.get("uname")
-        else:
-            return None            
+        res_json = _request_json('GET', url, action='获取主播昵称')
+        info_dict = res_json.get("data", {}).get("info")
+        if info_dict is not None:
+            return info_dict.get("uname")
     except Exception:
         return None
 
@@ -108,8 +144,13 @@ def send_danmaku(room_id, msg):
         'csrf': csrf_token,
         'csrf_token': csrf_token,
     }
-    response = requests.post('https://api.live.bilibili.com/msg/send', cookies=cookies, headers=HEADERS, data=payload)
-    return response
+    return _request_json(
+        'POST',
+        'https://api.live.bilibili.com/msg/send',
+        action='发送弹幕',
+        cookies=cookies,
+        data=payload,
+    )
 
 def send_like(room_id, click_times, anchor_id, img_key, sub_key):
     """自动点赞"""
@@ -124,9 +165,13 @@ def send_like(room_id, click_times, anchor_id, img_key, sub_key):
     }
     signed_payload = generate_wbi_signature(payload, img_key, sub_key)
     url = 'https://api.live.bilibili.com/xlive/app-ucenter/v1/like_info_v3/like/likeReportV3'
-    response = requests.post(url, headers=HEADERS, params=signed_payload, cookies=cookies)
-    print(f"[{time.strftime('%H:%M:%S')}] 房间 {room_id} 点赞发送结果: {response.status_code}")
-    return response
+    return _request_json(
+        'POST',
+        url,
+        action='发送点赞',
+        params=signed_payload,
+        cookies=cookies,
+    )
 
 # ==========================================
 # 4. 主控战场 (Main Loop)

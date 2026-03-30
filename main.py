@@ -5,20 +5,32 @@ import time
 import json
 import qrcode
 import webbrowser
+import requests
 from typing import Literal
 from PIL import ImageQt
 from PySide6.QtWidgets import QWidget, QApplication, QDialog, QTableWidgetItem, QFileDialog, QHeaderView
 from PySide6.QtGui import QPixmap, QIcon
 from PySide6.QtCore import QObject, QTimer, Slot, QRunnable, QThreadPool, Signal, Qt, QDateTime
-from console import Ui_MainWindow
-from qr_window import Ui_qr_dialog
+from ui_codes.console import Ui_MainWindow
+from ui_codes.qr_window import Ui_qr_dialog
 from bilibili_login import get_qrcode, poll_if_scan, check_cookie_valid, get_executable_dir
 from bilibili_bot import get_anchor_name, get_anchor_id, send_danmaku, send_like, get_wbi_keys
+from task_config import TaskConfigError, load_task_list, normalize_task_list
 
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
+
+
+def format_exception_for_log(error: Exception) -> str:
+    if isinstance(error, requests.Timeout):
+        return "网络请求超时，请检查网络连接后重试"
+    if isinstance(error, requests.ConnectionError):
+        return "网络连接失败，请检查网络后重试"
+    if isinstance(error, requests.HTTPError):
+        return f"B站接口访问失败：{error}"
+    return str(error)
 
 class MySignal(QObject):
     error = Signal(tuple)
@@ -72,6 +84,7 @@ class MainConsole(QWidget):
         self.is_sending = False
         self.is_liking = False
         self.is_timing = False
+        self.target_datetime = None
 
         self.timer_send = QTimer(self)
 
@@ -99,13 +112,14 @@ class MainConsole(QWidget):
         default_config_path = os.path.join(get_executable_dir(), "bilibili_tasks.json")
         if os.path.exists(default_config_path):
             try:
-                with open(default_config_path, "r", encoding="utf-8") as f:
-                    imported_data = json.load(f)
-                if isinstance(imported_data, list) and imported_data:
+                imported_data = load_task_list(default_config_path)
+                if imported_data:
                     self.task_list = imported_data
                     self._refresh_table_ui()
-            except Exception:
-                pass
+            except TaskConfigError as e:
+                self.print_log(f"默认任务配置加载失败：{e}")
+            except Exception as e:
+                self.print_log(f"默认任务配置加载失败：{format_exception_for_log(e)}")
 
     def bind_signals(self):
         self.ui.btn_get_qr.clicked.connect(self.start_fetch_qrcode)
@@ -169,6 +183,10 @@ class MainConsole(QWidget):
             self.ui.table_tasks.setItem(row_index, 3, self._make_item(str(task.get("send_interval"))))
 
     def _send_danmaku_circ(self, task_list: list, log_signal: Signal):
+        if not task_list:
+            log_signal.emit("任务队列为空，请先添加任务")
+            return
+
         for task in task_list:
             if not self.is_sending: 
                 log_signal.emit("已停止发送弹幕")
@@ -205,6 +223,8 @@ class MainConsole(QWidget):
         try:
             IMG_KEY, SUB_KEY = get_wbi_keys()
             anchor_id = get_anchor_id(room_id)
+            if not anchor_id:
+                raise RuntimeError("未能获取主播 UID，请检查房间号或网络")
         except Exception as e:
             self.is_liking = False
             log_signal.emit(f"点赞准备失败: {e}")
@@ -233,6 +253,7 @@ class MainConsole(QWidget):
 
     @Slot()
     def start_fetch_qrcode(self):
+        self.ui.btn_get_qr.setEnabled(False)
         worker_fetch_qrcode = Worker(get_qrcode)
         worker_fetch_qrcode.signals.result.connect(self.on_qrcode_fetched)
         worker_fetch_qrcode.signals.error.connect(self.on_qr_error)
@@ -258,16 +279,18 @@ class MainConsole(QWidget):
                 self.print_log("登录失败，原登录凭证依旧有效，已自动恢复")
             else:
                 self.print_log("登录失败，请重新扫码登录")
+        self.ui.btn_get_qr.setEnabled(True)
 
     @Slot()
     def on_qr_error(self, error_tuple):
         _, value, _ = error_tuple
-        self.print_log(f"获取登录二维码失败，请检查网络连接: {value}")
+        self.print_log(f"获取登录二维码失败，请检查网络连接: {format_exception_for_log(value)}")
+        self.ui.btn_get_qr.setEnabled(True)
 
     @Slot()
     def start_add_task(self):
-        room_id = self.ui.input_room_id.text()
-        danmaku_msg = self.ui.input_danmaku_text.toPlainText()
+        room_id = self.ui.input_room_id.text().strip()
+        danmaku_msg = self.ui.input_danmaku_text.toPlainText().strip()
         if not room_id or not danmaku_msg:
             self.print_log("房号和弹幕内容均不能为空")
             return
@@ -297,8 +320,14 @@ class MainConsole(QWidget):
             self.ui.table_tasks.setItem(current_row_count, 3, self._make_item(new_task.get("send_interval")))
         
         elif action == "edit":
-            self.task_list[selected_row]["uname"] = anchor_name
+            if selected_row < 0 or selected_row >= len(self.task_list):
+                return
+            new_task["uname"] = anchor_name
+            self.task_list[selected_row] = new_task
             self.ui.table_tasks.setItem(selected_row, 0, self._make_item(anchor_name))
+            self.ui.table_tasks.setItem(selected_row, 1, self._make_item(new_task.get("msg")))
+            self.ui.table_tasks.setItem(selected_row, 2, self._make_item(new_task.get("loop")))
+            self.ui.table_tasks.setItem(selected_row, 3, self._make_item(new_task.get("send_interval")))
 
     @Slot()
     def slot_edit_task(self):
@@ -308,22 +337,25 @@ class MainConsole(QWidget):
             return
         old_room_id = self.task_list[selected_row].get("room")
         old_uname = self.task_list[selected_row].get("uname")
-        new_room_id = self.ui.input_room_id.text()
-        new_danmaku_msg = self.ui.input_danmaku_text.toPlainText()
+        new_room_id = self.ui.input_room_id.text().strip()
+        new_danmaku_msg = self.ui.input_danmaku_text.toPlainText().strip()
+        if not new_room_id or not new_danmaku_msg:
+            self.print_log("房号和弹幕内容均不能为空")
+            return
         new_loop_times = self.ui.spin_loop_count.value()
         new_send_interval = self.ui.spin_interval.value()
         new_task = {"room": new_room_id, "uname": old_uname, "msg": new_danmaku_msg, "loop": new_loop_times, "send_interval": new_send_interval}
-  
-        self.task_list[selected_row] = new_task
 
+        if old_room_id != new_room_id:
+            worker_fetch_anchor_name = Worker(lambda: (get_anchor_name(new_room_id), new_task, "edit", selected_row))
+            worker_fetch_anchor_name.signals.result.connect(self.on_uname_fetched)
+            self.threadpool.start(worker_fetch_anchor_name)
+            return
+
+        self.task_list[selected_row] = new_task
         self.ui.table_tasks.setItem(selected_row, 1, self._make_item(new_task.get("msg")))
         self.ui.table_tasks.setItem(selected_row, 2, self._make_item(new_task.get("loop")))
         self.ui.table_tasks.setItem(selected_row, 3, self._make_item(new_task.get("send_interval")))
-
-        if old_room_id != new_room_id:
-            worker_fetch_anchor_name = Worker(lambda: (get_anchor_name(new_room_id), {}, "edit", selected_row))
-            worker_fetch_anchor_name.signals.result.connect(self.on_uname_fetched)
-            self.threadpool.start(worker_fetch_anchor_name)            
             
     @Slot()
     def slot_delete_task(self):
@@ -352,11 +384,14 @@ class MainConsole(QWidget):
 
         if file_path:
             try:
+                normalized_task_list = normalize_task_list(self.task_list)
                 with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(self.task_list, f, ensure_ascii=False, indent=4)
+                    json.dump(normalized_task_list, f, ensure_ascii=False, indent=4)
                 self.print_log(f"任务配置已成功保存至：{file_path}")
+            except TaskConfigError as e:
+                self.print_log(f"保存配置失败：{e}")
             except Exception as e:
-                self.print_log(f"保存配置失败: {e}")
+                self.print_log(f"保存配置失败：{format_exception_for_log(e)}")
 
     @Slot()
     def slot_load_config(self):
@@ -370,17 +405,14 @@ class MainConsole(QWidget):
         
         if file_path:
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    imported_data = json.load(f)
-                if isinstance(imported_data, list):
-                    self.task_list = imported_data
-                    self._refresh_table_ui() 
-                    self.print_log(f"成功导入配置：{file_path}")
-                else:
-                    self.print_log("导入失败：JSON 文件格式不合法")
-                    
+                imported_data = load_task_list(file_path)
+                self.task_list = imported_data
+                self._refresh_table_ui() 
+                self.print_log(f"成功导入配置：{file_path}")
+            except TaskConfigError as e:
+                self.print_log(f"导入配置失败：{e}")
             except Exception as e:
-                self.print_log(f"导入配置失败: {e}")
+                self.print_log(f"导入配置失败：{format_exception_for_log(e)}")
 
     @Slot()
     def slot_table_clicked(self):
@@ -395,6 +427,9 @@ class MainConsole(QWidget):
     @Slot()
     def toggle_send_danmaku(self):
         if not self.is_sending:
+            if not self.task_list:
+                self.print_log("任务队列为空，请先添加任务")
+                return
             self.is_sending = True
 
             self.ui.btn_start_send.setText("⏹️停止发送")
@@ -435,7 +470,7 @@ class MainConsole(QWidget):
     @Slot()
     def on_danmaku_error(self, error_tuple):
         _, value, _ = error_tuple
-        self.print_log(f"弹幕发送失败: {value}")
+        self.print_log(f"弹幕发送失败：{format_exception_for_log(value)}")
 
         self.is_sending = False
 
@@ -454,6 +489,9 @@ class MainConsole(QWidget):
     def slot_toggle_timing(self):
         """按下'定时发送'按钮时触发"""
         if not self.is_timing:
+            if not self.task_list:
+                self.print_log("任务队列为空，请先添加任务后再设置定时")
+                return
             target_qtime = self.ui.time_schedule.dateTime() 
             current_qtime = QDateTime.currentDateTime()
 
@@ -474,19 +512,24 @@ class MainConsole(QWidget):
         else:
             self.is_timing = False
             self.timer_send.stop()
+            self.target_datetime = None
 
             self.ui.btn_schedule_send.setText("⏰️定时发送")
             self.ui.btn_schedule_send.setEnabled(True)
             self.ui.btn_start_send.setEnabled(True)
+            self.ui.time_schedule.setEnabled(True)
             self.print_log("定时任务已手动关闭")
 
     @Slot()
     def check_timing_tick(self):
         """检查是否到达设定时间"""
+        if self.target_datetime is None:
+            return
         if QDateTime.currentDateTime() >= self.target_datetime:
 
             self.timer_send.stop() 
             self.is_timing = False
+            self.target_datetime = None
             
             self.ui.btn_schedule_send.setText("⏰️定时发送")
             self.ui.time_schedule.setEnabled(True)
@@ -530,7 +573,7 @@ class MainConsole(QWidget):
     @Slot()
     def on_like_error(self, error_tuple):
         _, value, _ = error_tuple
-        self.print_log(f"点赞任务发生异常: {value}")
+        self.print_log(f"点赞任务发生异常：{format_exception_for_log(value)}")
 
         self.is_liking = False
         self.ui.btn_like.setText("❤️一键点赞")
@@ -575,7 +618,7 @@ class MainConsole(QWidget):
                     f.write(log_content)
                 self.print_log(f"日志已导出至硬盘：{file_path}")
             except Exception as e:
-                self.print_log(f"日志导入失败: {e}")
+                self.print_log(f"日志导出失败：{format_exception_for_log(e)}")
 
     def closeEvent(self, event):
         self.is_sending = False
@@ -595,6 +638,8 @@ class QRDialog(QDialog):
         
         self.qrcode_key = qrcode_key
         self.qrcode_qpixmap = qrcode_qpixmap
+        self.poll_in_flight = False
+        self.is_closing = False
         
         self._embed_qrcode()
         
@@ -606,6 +651,9 @@ class QRDialog(QDialog):
 
     @Slot()
     def start_poll_if_scan(self):
+        if self.poll_in_flight:
+            return
+        self.poll_in_flight = True
         worker_poll_if_scan = Worker(poll_if_scan, self.qrcode_key)
         worker_poll_if_scan.signals.result.connect(self.on_poll_finished)
         worker_poll_if_scan.signals.error.connect(self.on_poll_error)
@@ -613,6 +661,9 @@ class QRDialog(QDialog):
 
     @Slot()
     def on_poll_finished(self, poll_response: Literal["Success", "Waiting", "Confirming", "Timeout"]):
+        self.poll_in_flight = False
+        if self.is_closing:
+            return
         if poll_response == "Success":
             self.timer.stop()
             self.accept()
@@ -624,11 +675,15 @@ class QRDialog(QDialog):
 
     @Slot()
     def on_poll_error(self, _):
+        self.poll_in_flight = False
+        if self.is_closing:
+            return
         self.timer.stop()
         self.ui.label_qr_tips.setText("验证失败，请关闭重试")
         self.ui.label_qr_tips.setStyleSheet("color: red;")
 
     def closeEvent(self, arg__1):
+        self.is_closing = True
         self.timer.stop()
         return super().closeEvent(arg__1)     
 
